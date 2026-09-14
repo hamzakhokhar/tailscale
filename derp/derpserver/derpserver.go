@@ -1974,7 +1974,7 @@ type pkt struct {
 // sclient.sendWake.
 type pktQueue struct {
 	mu     sync.Mutex
-	ring   *[]pkt // nil while empty; length Server.perClientSendQueueDepth otherwise
+	ring   *[]pkt // nil iff n == 0; length Server.perClientSendQueueDepth otherwise
 	head   int    // ring index of the oldest queued packet; meaningful only when n > 0
 	n      int    // number of queued packets
 	closed bool   // set by close; enqueues fail once set
@@ -2017,8 +2017,15 @@ func (q *pktQueue) dequeue(s *Server) (p pkt, ok bool) {
 	if q.n == 0 {
 		return pkt{}, false
 	}
+	return q.popLocked(s), true
+}
+
+// popLocked removes and returns the packet at the head of the queue,
+// which must be non-empty. When the queue drains empty its ring is
+// returned to the pool. q.mu must be held.
+func (q *pktQueue) popLocked(s *Server) pkt {
 	ring := *q.ring
-	p = ring[q.head]
+	p := ring[q.head]
 	ring[q.head] = pkt{} // don't retain p.bs past delivery
 	q.head = (q.head + 1) % len(ring)
 	q.n--
@@ -2026,30 +2033,22 @@ func (q *pktQueue) dequeue(s *Server) (p pkt, ok bool) {
 		s.sendQueueRingPool.Put(q.ring)
 		q.ring = nil
 	}
-	return p, true
+	return p
 }
 
 // close marks the queue closed so that no further packets can be
-// enqueued, calls drop for each packet still queued, and releases the
-// ring. Closing keeps stragglers in sendPkt from enqueueing onto a
-// gone client, which matters because the rings are pooled: a packet
-// enqueued after the drain here would otherwise surface in some other
-// client's queue when the ring is reused.
+// enqueued, and calls drop for each packet still queued, which
+// releases the ring. Closing keeps stragglers in sendPkt from
+// enqueueing onto a gone client, which matters because the rings are
+// pooled: a packet enqueued after the drain here would otherwise
+// surface in some other client's queue when the ring is reused.
 func (q *pktQueue) close(s *Server, drop func(pkt)) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.closed = true
-	if q.ring == nil {
-		return
+	for q.n > 0 {
+		drop(q.popLocked(s))
 	}
-	ring := *q.ring
-	for ; q.n > 0; q.n-- {
-		drop(ring[q.head])
-		ring[q.head] = pkt{}
-		q.head = (q.head + 1) % len(ring)
-	}
-	s.sendQueueRingPool.Put(q.ring)
-	q.ring = nil
 }
 
 // peerGoneMsg is a request to write a peerGone frame to an sclient
