@@ -2162,15 +2162,21 @@ func (c *sclient) sendLoop(ctx context.Context) error {
 			inBatch++
 			continue
 		default:
-			// The pktQueues aren't selectable, so poll them here,
-			// disco packets first.
-			if msg, ok := c.discoSendQueue.dequeue(c.s); ok {
+			// The pktQueues aren't selectable, so poll them here.
+			// Pick which to try first at random, as select did when
+			// these were channels and both had packets ready, so
+			// neither disco nor regular packets can starve the other.
+			q1, q2 := &c.discoSendQueue, &c.sendQueue
+			if rand.IntN(2) == 0 {
+				q1, q2 = q2, q1
+			}
+			if msg, ok := q1.dequeue(c.s); ok {
 				werr = c.sendPacket(msg.src, msg.bs)
 				c.recordQueueTime(msg.enqueuedAt)
 				inBatch++
 				continue
 			}
-			if msg, ok := c.sendQueue.dequeue(c.s); ok {
+			if msg, ok := q2.dequeue(c.s); ok {
 				werr = c.sendPacket(msg.src, msg.bs)
 				c.recordQueueTime(msg.enqueuedAt)
 				inBatch++
