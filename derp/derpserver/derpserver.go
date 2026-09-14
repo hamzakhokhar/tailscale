@@ -411,11 +411,17 @@ func New(privateKey key.NodePrivate, logf logger.Logf) *Server {
 	genDroppedCounters()
 
 	s.perClientSendQueueDepth = getPerClientSendQueueDepth()
-	s.sendQueueRingPool.New = func() any {
-		ring := make([]pkt, s.perClientSendQueueDepth)
-		return &ring
-	}
 	return s
+}
+
+// getSendQueueRing returns a send queue ring buffer from
+// s.sendQueueRingPool, or a fresh one if the pool is empty.
+func (s *Server) getSendQueueRing() *[]pkt {
+	if ring, ok := s.sendQueueRingPool.Get().(*[]pkt); ok {
+		return ring
+	}
+	ring := make([]pkt, s.perClientSendQueueDepth)
+	return &ring
 }
 
 func genDroppedCounters() {
@@ -1975,16 +1981,13 @@ type pktQueue struct {
 func (q *pktQueue) enqueue(s *Server, p pkt) (dropped pkt, ok bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if q.closed {
+	if q.closed || s.perClientSendQueueDepth == 0 {
 		return pkt{}, false
 	}
 	if q.ring == nil {
-		q.ring = s.sendQueueRingPool.Get().(*[]pkt)
+		q.ring = s.getSendQueueRing()
 	}
 	ring := *q.ring
-	if len(ring) == 0 {
-		return pkt{}, false
-	}
 	if q.n == len(ring) {
 		dropped = ring[q.head]
 		q.head = (q.head + 1) % len(ring)

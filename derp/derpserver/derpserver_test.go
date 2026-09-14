@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1733,5 +1734,101 @@ func BenchmarkSenderCardinalityOverhead(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			_ = sender.AppendTo(nil)
 		}
+	})
+}
+
+func TestPktQueue(t *testing.T) {
+	mkpkt := func(i int) pkt { return pkt{bs: []byte{byte(i)}} }
+	src := key.NewNode().Public()
+
+	t.Run("fifo_and_pool", func(t *testing.T) {
+		s := New(key.NewNode(), t.Logf)
+		defer s.Close()
+		s.perClientSendQueueDepth = 3
+
+		var q pktQueue
+		if _, ok := q.dequeue(s); ok {
+			t.Fatal("dequeue on empty queue reported ok")
+		}
+		for i := range 3 {
+			dropped, ok := q.enqueue(s, mkpkt(i))
+			if !ok || dropped.bs != nil {
+				t.Fatalf("enqueue %d: ok=%v dropped=%v", i, ok, dropped.bs)
+			}
+		}
+		if q.ring == nil {
+			t.Fatal("ring not allocated after enqueue")
+		}
+		// Full: the head (0) is dropped to make room for 3.
+		dropped, ok := q.enqueue(s, mkpkt(3))
+		if !ok || string(dropped.bs) != "\x00" {
+			t.Fatalf("enqueue on full queue: ok=%v dropped=%q, want head 0 dropped", ok, dropped.bs)
+		}
+		var got []byte
+		for {
+			p, ok := q.dequeue(s)
+			if !ok {
+				break
+			}
+			got = append(got, p.bs...)
+		}
+		if want := "\x01\x02\x03"; string(got) != want {
+			t.Errorf("dequeued %q, want %q", got, want)
+		}
+		if q.ring != nil {
+			t.Error("ring not released to the pool after draining")
+		}
+		// The ring should have gone back to the pool with no
+		// packets still referenced from it.
+		if ring, ok := s.sendQueueRingPool.Get().(*[]pkt); ok {
+			for i, p := range *ring {
+				if p.bs != nil {
+					t.Errorf("pooled ring slot %d still holds a packet", i)
+				}
+			}
+		}
+	})
+
+	t.Run("close", func(t *testing.T) {
+		s := New(key.NewNode(), t.Logf)
+		defer s.Close()
+		s.perClientSendQueueDepth = 4
+
+		var q pktQueue
+		q.enqueue(s, pkt{bs: []byte("a"), src: src})
+		q.enqueue(s, pkt{bs: []byte("b"), src: src})
+		var dropped []string
+		q.close(s, func(p pkt) { dropped = append(dropped, string(p.bs)) })
+		if want := []string{"a", "b"}; !slices.Equal(dropped, want) {
+			t.Errorf("close dropped %q, want %q", dropped, want)
+		}
+		if q.ring != nil {
+			t.Error("ring not released on close")
+		}
+		if _, ok := q.enqueue(s, mkpkt(0)); ok {
+			t.Error("enqueue after close succeeded")
+		}
+		if q.ring != nil {
+			t.Error("enqueue after close allocated a ring")
+		}
+	})
+
+	// A Server that didn't come from New (as some unit tests build)
+	// has no configured queue depth and an unprimed pool. Enqueues must
+	// fail cleanly rather than panic on a nil pool.Get result, and must
+	// not allocate.
+	t.Run("zero_server", func(t *testing.T) {
+		s := &Server{}
+		var q pktQueue
+		if _, ok := q.enqueue(s, mkpkt(0)); ok {
+			t.Error("enqueue on zero-depth queue succeeded")
+		}
+		if q.ring != nil {
+			t.Error("zero-depth enqueue allocated a ring")
+		}
+		if _, ok := q.dequeue(s); ok {
+			t.Error("dequeue on zero-depth queue reported ok")
+		}
+		q.close(s, func(pkt) { t.Error("close on empty queue dropped a packet") })
 	})
 }
