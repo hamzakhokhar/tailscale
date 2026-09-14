@@ -1751,18 +1751,25 @@ func TestPktQueue(t *testing.T) {
 			t.Fatal("dequeue on empty queue reported ok")
 		}
 		for i := range 3 {
-			dropped, ok := q.enqueue(s, mkpkt(i))
+			dropped, wasEmpty, ok := q.enqueue(s, mkpkt(i))
 			if !ok || dropped.bs != nil {
 				t.Fatalf("enqueue %d: ok=%v dropped=%v", i, ok, dropped.bs)
+			}
+			// Only the first enqueue finds the queue empty.
+			if want := i == 0; wasEmpty != want {
+				t.Errorf("enqueue %d: wasEmpty=%v, want %v", i, wasEmpty, want)
 			}
 		}
 		if q.ring == nil {
 			t.Fatal("ring not allocated after enqueue")
 		}
 		// Full: the head (0) is dropped to make room for 3.
-		dropped, ok := q.enqueue(s, mkpkt(3))
+		dropped, wasEmpty, ok := q.enqueue(s, mkpkt(3))
 		if !ok || string(dropped.bs) != "\x00" {
 			t.Fatalf("enqueue on full queue: ok=%v dropped=%q, want head 0 dropped", ok, dropped.bs)
+		}
+		if wasEmpty {
+			t.Error("enqueue on full queue reported wasEmpty")
 		}
 		var got []byte
 		for {
@@ -1805,7 +1812,7 @@ func TestPktQueue(t *testing.T) {
 		if q.ring != nil {
 			t.Error("ring not released on close")
 		}
-		if _, ok := q.enqueue(s, mkpkt(0)); ok {
+		if _, _, ok := q.enqueue(s, mkpkt(0)); ok {
 			t.Error("enqueue after close succeeded")
 		}
 		if q.ring != nil {
@@ -1820,7 +1827,7 @@ func TestPktQueue(t *testing.T) {
 	t.Run("zero_server", func(t *testing.T) {
 		s := &Server{}
 		var q pktQueue
-		if _, ok := q.enqueue(s, mkpkt(0)); ok {
+		if _, _, ok := q.enqueue(s, mkpkt(0)); ok {
 			t.Error("enqueue on zero-depth queue succeeded")
 		}
 		if q.ring != nil {
@@ -1831,6 +1838,43 @@ func TestPktQueue(t *testing.T) {
 		}
 		q.close(s, func(pkt) { t.Error("close on empty queue dropped a packet") })
 	})
+}
+
+// TestSendPktHeadDropAttribution checks that when a full queue drops
+// its head packet to make room, the drop is attributed to that
+// packet's sender, not to the sender of the packet that displaced it.
+func TestSendPktHeadDropAttribution(t *testing.T) {
+	var logMu sync.Mutex
+	var logs []string
+	s := New(key.NewNode(), func(format string, args ...any) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		logs = append(logs, fmt.Sprintf(format, args...))
+	})
+	defer s.Close()
+	s.perClientSendQueueDepth = 1
+
+	dst := &sclient{s: s, key: key.NewNode().Public(), sendWake: make(chan struct{}, 1)}
+	first := &sclient{s: s, key: key.NewNode().Public()}
+	second := &sclient{s: s, key: key.NewNode().Public()}
+
+	// Drops to dst are logged verbosely, with the source key.
+	verboseDropKeys[dst.key] = true
+	defer delete(verboseDropKeys, dst.key)
+
+	if err := first.sendPkt(dst, pkt{bs: []byte("first"), src: first.key}); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.sendPkt(dst, pkt{bs: []byte("second"), src: second.key}); err != nil {
+		t.Fatal(err)
+	}
+
+	logMu.Lock()
+	defer logMu.Unlock()
+	want := fmt.Sprintf("drop (%s) %s -> %s", first.key.ShortString(), dropReasonQueueHead, dst.key.ShortString())
+	if !slices.Contains(logs, want) {
+		t.Errorf("logs = %q; want to contain %q", logs, want)
+	}
 }
 
 // gatedConn is a derp.Conn whose Writes block until the test releases

@@ -1527,7 +1527,7 @@ func (c *sclient) sendPkt(dst *sclient, p pkt) error {
 	if disco.LooksLikeDiscoWrapper(p.bs) {
 		q = &dst.discoSendQueue
 	}
-	dropped, ok := q.enqueue(s, p)
+	dropped, wasEmpty, ok := q.enqueue(s, p)
 	if !ok {
 		// The queue is closed (the client is gone) or has zero
 		// capacity.
@@ -1542,12 +1542,19 @@ func (c *sclient) sendPkt(dst *sclient, p pkt) error {
 	if dropped.bs != nil {
 		// The queue was full; the packet at its head was dropped to
 		// make room, prioritizing fresher packets.
-		s.recordDrop(dropped.bs, c.key, dstKey, dropReasonQueueHead)
+		s.recordDrop(dropped.bs, dropped.src, dstKey, dropReasonQueueHead)
 		c.recordQueueTime(dropped.enqueuedAt)
 	}
-	select {
-	case dst.sendWake <- struct{}{}:
-	default: // a wake-up is already pending
+	if wasEmpty {
+		// Wake dst's sendLoop, which may be parked. This is only
+		// needed when p made the queue non-empty: otherwise the
+		// sendLoop is either mid-drain and will get to p before it
+		// parks, or the wake from the packet that made the queue
+		// non-empty is still pending.
+		select {
+		case dst.sendWake <- struct{}{}:
+		default: // a wake-up is already pending
+		}
 	}
 	dst.debugLogf("sendPkt enqueued")
 	return nil
@@ -1977,17 +1984,20 @@ type pktQueue struct {
 // head to make room if the queue is full. It reports whether p was
 // enqueued; it is not when the queue is closed (the client is gone) or
 // has zero capacity. When a head drop made room, the dropped packet is
-// returned with a non-nil bs for the caller to record.
-func (q *pktQueue) enqueue(s *Server, p pkt) (dropped pkt, ok bool) {
+// returned with a non-nil bs for the caller to record. wasEmpty
+// reports whether the queue was empty before p was added, meaning the
+// caller needs to wake the sendLoop; see sendPkt.
+func (q *pktQueue) enqueue(s *Server, p pkt) (dropped pkt, wasEmpty, ok bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.closed || s.perClientSendQueueDepth == 0 {
-		return pkt{}, false
+		return pkt{}, false, false
 	}
 	if q.ring == nil {
 		q.ring = s.getSendQueueRing()
 	}
 	ring := *q.ring
+	wasEmpty = q.n == 0
 	if q.n == len(ring) {
 		dropped = ring[q.head]
 		q.head = (q.head + 1) % len(ring)
@@ -1995,7 +2005,7 @@ func (q *pktQueue) enqueue(s *Server, p pkt) (dropped pkt, ok bool) {
 	}
 	ring[(q.head+q.n)%len(ring)] = p
 	q.n++
-	return dropped, true
+	return dropped, wasEmpty, true
 }
 
 // dequeue removes and returns the packet at the head of the queue,
