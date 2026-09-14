@@ -1832,3 +1832,123 @@ func TestPktQueue(t *testing.T) {
 		q.close(s, func(pkt) { t.Error("close on empty queue dropped a packet") })
 	})
 }
+
+// gatedConn is a derp.Conn whose Writes block until the test releases
+// them, one at a time, so a test can hold sendLoop inside a Flush.
+type gatedConn struct {
+	writes chan int      // receives len(p) as each Write begins
+	gate   chan struct{} // each Write completes on receiving from it
+	closed chan struct{} // closed by Close
+	once   sync.Once
+}
+
+func newGatedConn() *gatedConn {
+	return &gatedConn{
+		writes: make(chan int, 16),
+		gate:   make(chan struct{}),
+		closed: make(chan struct{}),
+	}
+}
+
+func (c *gatedConn) Write(p []byte) (int, error) {
+	c.writes <- len(p)
+	select {
+	case <-c.gate:
+		return len(p), nil
+	case <-c.closed:
+		return 0, net.ErrClosed
+	}
+}
+
+func (c *gatedConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (c *gatedConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (c *gatedConn) SetDeadline(time.Time) error      { return nil }
+func (c *gatedConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *gatedConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestSendLoopBufferedWriteFrames checks that the bufferedWriteFrames
+// histogram counts exactly the frames written per flush. In
+// particular a sendWake pass that itself writes nothing must not
+// inflate the count of the batch that follows it.
+func TestSendLoopBufferedWriteFrames(t *testing.T) {
+	s := New(key.NewNode(), t.Logf)
+	defer s.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := newGatedConn()
+	c := &sclient{
+		s:          s,
+		key:        key.NewNode().Public(),
+		nc:         conn,
+		bw:         &lazyBufioWriter{w: conn},
+		logf:       t.Logf,
+		ctx:        ctx,
+		sendWake:   make(chan struct{}, 1),
+		sendPongCh: make(chan [8]byte, 1),
+		peerGone:   make(chan peerGoneMsg),
+	}
+	done := make(chan error, 1)
+	go func() { done <- c.sendLoop(ctx) }()
+
+	src := key.NewNode().Public()
+	send := func(n int) {
+		for range n {
+			if err := c.sendPkt(c, pkt{bs: []byte("hello"), src: src}); err != nil {
+				t.Fatalf("sendPkt: %v", err)
+			}
+		}
+	}
+	// awaitWrite waits for sendLoop to be blocked in a Write, which
+	// happens only from Flush.
+	awaitWrite := func() {
+		t.Helper()
+		select {
+		case <-conn.writes:
+		case <-time.After(10 * time.Second):
+			t.Fatal("timeout waiting for sendLoop to flush")
+		}
+	}
+	release := func() { conn.gate <- struct{}{} }
+
+	// One packet: sendLoop writes it and blocks flushing it.
+	send(1)
+	awaitWrite()
+
+	// While it's blocked, queue a batch. Its sendWake lands in the
+	// wake channel and is consumed by the blocking select after the
+	// first flush's observation, without writing anything itself.
+	const batch = 5
+	send(batch)
+	release()
+
+	// The batch is drained in one pass and flushed.
+	awaitWrite()
+	release()
+
+	// A pong forces one more write and flush; once that Write has
+	// begun, the batch's observation has been recorded.
+	c.sendPongCh <- [8]byte{}
+	awaitWrite()
+
+	var h map[string]float64
+	if err := json.Unmarshal([]byte(s.bufferedWriteFrames.String()), &h); err != nil {
+		t.Fatal(err)
+	}
+	// The buckets are cumulative, so the number of observations of
+	// exactly v is bucket[v] minus bucket[v-1].
+	exactly := func(v int) float64 { return h[strconv.Itoa(v)] - h[strconv.Itoa(v-1)] }
+	if h["count"] != 2 || exactly(1) != 1 || exactly(batch) != 1 {
+		t.Errorf("histogram = %v; want exactly two observations, one of 1 and one of %d", h, batch)
+	}
+
+	release()
+	cancel()
+	if err := <-done; err != nil {
+		t.Errorf("sendLoop: %v", err)
+	}
+}

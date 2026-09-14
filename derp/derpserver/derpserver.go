@@ -2125,12 +2125,11 @@ func (c *sclient) sendLoop(ctx context.Context) error {
 	defer keepAliveTick.Stop()
 
 	var werr error // last write error
-	inBatch := -1  // for bufferedWriteFrames
+	inBatch := 0   // frames (or groups of related frames) written since the last flush, for bufferedWriteFrames
 	for {
 		if werr != nil {
 			return werr
 		}
-		inBatch++
 		// First, a non-blocking select (with a default) that
 		// does as many non-flushing writes as possible.
 		select {
@@ -2138,15 +2137,19 @@ func (c *sclient) sendLoop(ctx context.Context) error {
 			return nil
 		case msg := <-c.peerGone:
 			werr = c.sendPeerGone(msg.peer, msg.reason)
+			inBatch++
 			continue
 		case <-c.meshUpdate:
 			werr = c.sendMeshUpdates()
+			inBatch++
 			continue
 		case msg := <-c.sendPongCh:
 			werr = c.sendPong(msg)
+			inBatch++
 			continue
 		case <-keepAliveTickChannel:
 			werr = c.sendKeepAlive()
+			inBatch++
 			continue
 		default:
 			// The pktQueues aren't selectable, so poll them here,
@@ -2154,11 +2157,13 @@ func (c *sclient) sendLoop(ctx context.Context) error {
 			if msg, ok := c.discoSendQueue.dequeue(c.s); ok {
 				werr = c.sendPacket(msg.src, msg.bs)
 				c.recordQueueTime(msg.enqueuedAt)
+				inBatch++
 				continue
 			}
 			if msg, ok := c.sendQueue.dequeue(c.s); ok {
 				werr = c.sendPacket(msg.src, msg.bs)
 				c.recordQueueTime(msg.enqueuedAt)
+				inBatch++
 				continue
 			}
 			// Flush any writes from the sends above, or from
@@ -2166,7 +2171,10 @@ func (c *sclient) sendLoop(ctx context.Context) error {
 			if werr = c.bw.Flush(); werr != nil {
 				return werr
 			}
-			if inBatch != 0 { // the first loop will almost always hit default & be size zero
+			// Nothing to observe when nothing was written, as on the
+			// first pass or after a sendWake whose packets an earlier
+			// pass already drained.
+			if inBatch != 0 {
 				c.s.bufferedWriteFrames.Observe(float64(inBatch))
 				inBatch = 0
 			}
@@ -2178,15 +2186,20 @@ func (c *sclient) sendLoop(ctx context.Context) error {
 			return nil
 		case msg := <-c.peerGone:
 			werr = c.sendPeerGone(msg.peer, msg.reason)
+			inBatch++
 		case <-c.meshUpdate:
 			werr = c.sendMeshUpdates()
+			inBatch++
 		case <-c.sendWake:
 			// Packets were enqueued; the next loop iteration
-			// dequeues them above.
+			// dequeues them above. Nothing was written here, so
+			// inBatch is deliberately not incremented.
 		case msg := <-c.sendPongCh:
 			werr = c.sendPong(msg)
+			inBatch++
 		case <-keepAliveTickChannel:
 			werr = c.sendKeepAlive()
+			inBatch++
 		}
 	}
 }
